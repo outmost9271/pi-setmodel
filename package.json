@@ -1,6 +1,6 @@
 {
   "name": "pi-setmodel",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "pi-agent extension: /setmodel — set current and default model plus thinking level",
   "keywords": ["pi-package"],
   "license": "MIT",

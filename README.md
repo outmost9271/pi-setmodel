@@ -8,7 +8,7 @@ pi-agent 扩展：在 TUI 中新增 `/setmodel` 命令，一条命令同时完�
 ## 安装
 
 ```bash
-pi install git:github.com/outmost9271/pi-setmodel@v1.0.0
+pi install git:github.com/outmost9271/pi-setmodel@v1.0.1
 ```
 
 或本地路径调试：
@@ -40,8 +40,11 @@ pi install /absolute/path/to/pi-setmodel
 
 - 命令参数带补全：输入模型时与 `/model` 相同的模糊补全
   （`value=provider/id`、`label=id`、`description=provider`）；
-- 模型 + 空格后，补全列表只显示**该供应商该模型实际支持**的思考等级
-  （依据模型元数据与 `thinkingLevelMap` 过滤，不含其他模型都一样的固定列表）；
+- 模型 + 第一个空格后，会立即自动弹出思考等级补全；补全列表只显示
+  **该供应商该模型实际支持**的等级（依据模型元数据与 `thinkingLevelMap`
+  过滤，不含其他模型都一样的固定列表）；
+- 选择等级只替换等级片段，模型参数会保留，例如选择 `max` 后得到
+  `/setmodel deepseek/deepseek-v4-pro max`；
 - 思考等级不合法时命令报错并列出该模型支持的等级。
 
 ## 配置文件路径

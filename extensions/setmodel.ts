@@ -26,7 +26,12 @@ import {
   type ModelThinkingLevel,
   getSupportedThinkingLevels,
 } from "@earendil-works/pi-ai";
-import { type AutocompleteItem, fuzzyFilter } from "@earendil-works/pi-tui";
+import {
+  type AutocompleteItem,
+  type AutocompleteProvider,
+  fuzzyFilter,
+  matchesKey,
+} from "@earendil-works/pi-tui";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -76,14 +81,13 @@ function persistDefaults(providerId: string, modelId: string, level: ModelThinki
   writeFileSync(tmp, content, "utf-8");
   try {
     renameSync(tmp, path);
-  } catch (error) {
+  } catch {
     // Windows 上 rename 覆盖已存在文件可能失败，回退为直接写入。
     try {
       writeFileSync(path, content, "utf-8");
     } finally {
       rmSync(tmp, { force: true });
     }
-    throw error;
   }
 }
 
@@ -170,6 +174,61 @@ export function thinkingCompletions(
   return filtered.map((level) => ({ value: level, label: level }));
 }
 
+interface ThinkingCompletionContext {
+  modelRef: string;
+  levelPrefix: string;
+}
+
+/** 解析光标前的 /setmodel 第二参数上下文。 */
+export function parseThinkingCompletionContext(
+  lines: string[],
+  cursorLine: number,
+  cursorCol: number,
+): ThinkingCompletionContext | undefined {
+  const line = lines[cursorLine] ?? "";
+  const beforeCursor = line.slice(0, cursorCol);
+  const match = beforeCursor.match(/^\/setmodel[ \t]+(\S+)[ \t]+([^\s]*)$/);
+  if (!match?.[1]) return undefined;
+  return { modelRef: match[1], levelPrefix: match[2] ?? "" };
+}
+
+/**
+ * 包装内置 provider：第二参数补全只把 levelPrefix 作为替换范围。
+ * 这样选择 max 后保留模型，得到 /setmodel provider/model max。
+ * 同时允许合成的 Tab 请求在该上下文中走命令补全而不是文件补全。
+ */
+export function createSetmodelAutocompleteProvider(
+  current: AutocompleteProvider,
+  getSource: () => ModelsSource | undefined,
+): AutocompleteProvider {
+  return {
+    triggerCharacters: current.triggerCharacters,
+    async getSuggestions(lines, cursorLine, cursorCol, options) {
+      const context = parseThinkingCompletionContext(lines, cursorLine, cursorCol);
+      if (!context) return current.getSuggestions(lines, cursorLine, cursorCol, options);
+
+      const items = thinkingCompletions(getSource(), context.modelRef, context.levelPrefix);
+      return items ? { prefix: context.levelPrefix, items } : null;
+    },
+    applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+      return current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
+    },
+    shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
+      if (parseThinkingCompletionContext(lines, cursorLine, cursorCol)) return true;
+      return current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true;
+    },
+  };
+}
+
+/** 用户刚输入精确模型且尚未输入第二参数。 */
+export function getExactModelBeforeThinkingSpace(
+  text: string,
+  source: ModelsSource | undefined,
+): Model<Api> | undefined {
+  const match = text.match(/^\/setmodel[ \t]+(\S+)$/);
+  return match?.[1] ? findExactModelMatch(match[1], collectModels(source)) : undefined;
+}
+
 // ---------------------------------------------------------------------------
 // 扩展入口
 // ---------------------------------------------------------------------------
@@ -177,9 +236,33 @@ export function thinkingCompletions(
 export default function setmodelExtension(pi: ExtensionAPI): void {
   // getArgumentCompletions 拿不到 ctx，在 session_start 时缓存最新模型快照。
   let modelsSource: ModelsSource | undefined;
+  let unsubscribeTerminalInput: (() => void) | undefined;
 
   pi.on("session_start", (_event, ctx) => {
     modelsSource = { scopedModels: ctx.scopedModels, modelRegistry: ctx.modelRegistry };
+    if (ctx.mode !== "tui") return;
+
+    ctx.ui.addAutocompleteProvider((current) =>
+      createSetmodelAutocompleteProvider(current, () => modelsSource),
+    );
+
+    unsubscribeTerminalInput?.();
+    unsubscribeTerminalInput = ctx.ui.onTerminalInput((data) => {
+      if (!matchesKey(data, "space")) return undefined;
+      const text = ctx.ui.getEditorText();
+      if (!getExactModelBeforeThinkingSpace(text, modelsSource)) return undefined;
+
+      // Editor 不把空白符视为自动补全触发符：先写入用户的空格，再把本次
+      // 按键转换为 Tab。上面的 provider 包装器会让该强制请求走等级补全。
+      ctx.ui.setEditorText(`${text} `);
+      return { data: "\t" };
+    });
+  });
+
+  pi.on("session_shutdown", () => {
+    unsubscribeTerminalInput?.();
+    unsubscribeTerminalInput = undefined;
+    modelsSource = undefined;
   });
 
   pi.registerCommand("setmodel", {
@@ -193,7 +276,10 @@ export default function setmodelExtension(pi: ExtensionAPI): void {
       const tokens = prefix.trim().split(/\s+/).filter(Boolean);
       const modelRef = tokens[0];
       if (!modelRef) return null;
-      return thinkingCompletions(modelsSource, modelRef, tokens.slice(1).join(" "));
+      const levels = thinkingCompletions(modelsSource, modelRef, tokens.slice(1).join(" "));
+      // 内置命令 provider 把整段 argumentText 作为替换前缀，所以这里必须
+      // 返回完整参数；TUI provider 包装器则缩小 prefix，只替换等级片段。
+      return levels?.map((item) => ({ ...item, value: `${modelRef} ${item.value}` })) ?? null;
     },
     handler: async (args, ctx) => {
       const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);

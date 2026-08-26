@@ -6,7 +6,16 @@ const { createJiti } = require("./node_modules/@earendil-works/pi-coding-agent/n
 const jiti = createJiti(import.meta.url);
 const mod = await jiti.import("./extensions/setmodel.ts");
 
-const { findExactModelMatch, modelCompletions, thinkingCompletions, getModelSearchText } = mod;
+const {
+  default: createExtension,
+  createSetmodelAutocompleteProvider,
+  findExactModelMatch,
+  getExactModelBeforeThinkingSpace,
+  getModelSearchText,
+  modelCompletions,
+  parseThinkingCompletionContext,
+  thinkingCompletions,
+} = mod;
 const { getSupportedThinkingLevels } = await jiti.import("@earendil-works/pi-ai");
 
 const base = {
@@ -74,6 +83,70 @@ check("unsupported level prefix", thinkingCompletions(source, "deepseek/deepseek
 check("max level for anthropic", getSupportedThinkingLevels(models[0]).at(-1), "high");
 check("max level for deepseek-map", getSupportedThinkingLevels(models[2]).at(-1), "max");
 check("max level for non-reasoning", getSupportedThinkingLevels(models[3]).at(-1), "off");
+
+// --- 5. 第二参数上下文与替换范围 ---
+const thinkingLine = "/setmodel deepseek/deepseek-v4-pro ";
+check(
+  "parse empty thinking prefix",
+  parseThinkingCompletionContext([thinkingLine], 0, thinkingLine.length),
+  { modelRef: "deepseek/deepseek-v4-pro", levelPrefix: "" },
+);
+const typedThinkingLine = `${thinkingLine}m`;
+check(
+  "parse typed thinking prefix",
+  parseThinkingCompletionContext([typedThinkingLine], 0, typedThinkingLine.length),
+  { modelRef: "deepseek/deepseek-v4-pro", levelPrefix: "m" },
+);
+check("ignore first argument context", parseThinkingCompletionContext(["/setmodel deepseek/x"], 0, 24), undefined);
+check("exact model before space", getExactModelBeforeThinkingSpace("/setmodel deepseek/deepseek-v4-pro", source)?.id, "deepseek-v4-pro");
+check("unknown model before space", getExactModelBeforeThinkingSpace("/setmodel nope/x", source), undefined);
+
+const currentProvider = {
+  async getSuggestions() { return null; },
+  applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+    const next = [...lines];
+    const line = next[cursorLine] ?? "";
+    const before = line.slice(0, cursorCol - prefix.length);
+    const after = line.slice(cursorCol);
+    next[cursorLine] = before + item.value + after;
+    return { lines: next, cursorLine, cursorCol: before.length + item.value.length };
+  },
+  shouldTriggerFileCompletion() { return false; },
+};
+const wrappedProvider = createSetmodelAutocompleteProvider(currentProvider, () => source);
+const wrappedSuggestions = await wrappedProvider.getSuggestions(
+  [thinkingLine], 0, thinkingLine.length,
+  { signal: new AbortController().signal, force: true },
+);
+check("wrapper narrows replacement prefix", wrappedSuggestions?.prefix, "");
+check("wrapper exposes model levels", wrappedSuggestions?.items.map((item) => item.value), ["off", "high", "max"]);
+check("wrapper allows explicit trigger", wrappedProvider.shouldTriggerFileCompletion?.([thinkingLine], 0, thinkingLine.length), true);
+const appliedMax = wrappedProvider.applyCompletion(
+  [thinkingLine], 0, thinkingLine.length,
+  { value: "max", label: "max" },
+  wrappedSuggestions?.prefix ?? "",
+);
+check("selecting max preserves model", appliedMax.lines[0], "/setmodel deepseek/deepseek-v4-pro max");
+
+// --- 6. registerCommand 回退路径也返回完整参数 ---
+const handlers = {};
+let registeredCommand;
+const fakePi = {
+  on(name, handler) { handlers[name] = handler; },
+  registerCommand(name, options) { registeredCommand = { name, ...options }; },
+};
+createExtension(fakePi);
+handlers.session_start({}, { mode: "rpc", scopedModels: [], modelRegistry: source.modelRegistry });
+const commandLevels = registeredCommand.getArgumentCompletions("deepseek/deepseek-v4-pro ");
+check(
+  "command fallback values keep model",
+  commandLevels?.map((item) => item.value),
+  [
+    "deepseek/deepseek-v4-pro off",
+    "deepseek/deepseek-v4-pro high",
+    "deepseek/deepseek-v4-pro max",
+  ],
+);
 
 console.log(failures === 0 ? "\nALL PASSED" : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);
