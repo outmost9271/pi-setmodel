@@ -135,19 +135,76 @@ test("public callback fallback and shutdown", () => {
   assert.equal(command.getArgumentCompletions(""), null);
 });
 
-test("existing custom editor is not replaced; manual Tab works and old session stops", async () => {
+test("incompatible editor is reused unchanged; manual Tab works and old session stops", async () => {
   const { events } = mockPi();
+  const handleInput = () => {};
+  const editor = { handleInput };
   let wrap;
+  let factory = () => editor;
   events.session_start({}, { mode: "tui", ...source, ui: {
-    addAutocompleteProvider(factory) { wrap = factory; },
-    getEditorComponent() { return () => {}; },
-    setEditorComponent() { assert.fail("must not replace existing editor"); },
+    addAutocompleteProvider(providerFactory) { wrap = providerFactory; },
+    getEditorComponent() { return factory; },
+    setEditorComponent(editorFactory) { factory = editorFactory; },
   } });
+  assert.equal(factory(), editor);
+  assert.equal(editor.handleInput, handleInput);
   const wrapped = wrap(native);
   const line = "/setmodel:2 rsnr";
   assert.deepEqual((await wrapped.getSuggestions([line], 0, line.length, { signal, force: true })).items, [reasoner]);
   events.session_shutdown();
   assert.equal(await wrapped.getSuggestions([line], 0, line.length, { signal, force: true }), null);
+});
+
+test("queued refresh follows the active editor and current text and cursor, not the outer factory", async () => {
+  const { events } = mockPi();
+  let text = "/setmo";
+  let col = text.length;
+  let refreshes = 0;
+  const editor = {
+    focused: true,
+    getText: () => text,
+    getCursor: () => ({ line: 0, col }),
+    tryTriggerAutocomplete() { refreshes++; },
+    handleInput(data) { text += data; col = text.length; },
+  };
+  let provider;
+  let factory = () => editor;
+  events.session_start({}, { mode: "tui", ...source, ui: {
+    addAutocompleteProvider(wrap) { provider = wrap(native); },
+    getEditorComponent() { return factory; },
+    setEditorComponent(value) { factory = value; },
+  } });
+  const inner = factory;
+  factory = () => inner();
+  assert.equal(factory(), editor);
+  const input = editor.handleInput;
+  assert.equal(factory().handleInput, input); // A reused instance is not instrumented twice.
+
+  const name = { label: "setmodel:2", value: "setmodel:2" };
+  const accept = () => {
+    const result = provider.applyCompletion(["/setmo"], 0, 6, name, "/setmo");
+    text = result.lines[0];
+    col = result.cursorCol;
+  };
+  accept();
+  assert.equal(refreshes, 0);
+  await Promise.resolve();
+  assert.equal(refreshes, 1);
+
+  accept();
+  editor.focused = false;
+  await Promise.resolve();
+  editor.focused = true;
+  accept();
+  col--;
+  await Promise.resolve();
+  accept();
+  text += "x";
+  await Promise.resolve();
+  accept();
+  events.session_shutdown();
+  await Promise.resolve();
+  assert.equal(refreshes, 1);
 });
 
 test("submission validates arguments independently and persists only defaults", async () => {

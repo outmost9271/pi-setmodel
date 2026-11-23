@@ -30,7 +30,7 @@ MODELS = {"providers": {"lab": {
 
 
 class Terminal:
-    def __init__(self, root, mode, width, extra=()):
+    def __init__(self, root, mode, width, extra=(), after=()):
         self.settings = root / "agent/settings.json"
         self.height, self.width = 36, width
         self.screen = pyte.Screen(width, self.height)
@@ -42,7 +42,7 @@ class Terminal:
             env = {"HOME": str(root), "PI_CODING_AGENT_DIR": str(root / "agent"),
                    "PATH": os.environ["PATH"], "TERM": "xterm-256color", "LANG": "C.UTF-8"}
             os.execve(PI, [PI, "--offline", "--no-session", "--no-extensions", "--no-approve",
-                           "--tui-mode", mode, *extra, "-e", str(EXTENSION)], env)
+                           "--tui-mode", mode, *extra, "-e", str(EXTENSION), *after], env)
         self.resize(self.fd)
 
     def resize(self, fd):
@@ -269,7 +269,61 @@ export default (pi) => {
     print("PASS command collision, custom keybinding and stale-request cancellation")
 
 
+def run_editor_composition(sibling):
+    for before in (False, True):
+        with tempfile.TemporaryDirectory(prefix="setmodel-editor-composition-") as work:
+            root = Path(work)
+            (root / "agent").mkdir()
+            (root / "project").mkdir()
+            (root / "agent/models.json").write_text(json.dumps(MODELS))
+            fixture = root / "editor.ts"
+            fixture.write_text('''import { CustomEditor } from "@earendil-works/pi-coding-agent";
+export default (pi) => {
+  pi.on("session_start", (_event, ctx) => {
+    const previous = ctx.ui.getEditorComponent();
+    ctx.ui.setEditorComponent((tui, theme, keys) => {
+      const editor = previous?.(tui, theme, keys) ?? new CustomEditor(tui, theme, keys);
+      const handleInput = editor.handleInput.bind(editor);
+      editor.handleInput = (data) => handleInput(data === "?" ? "!" : data);
+      return editor;
+    });
+  });
+};
+''')
+            extension = ("-e", str(sibling or fixture))
+            t = Terminal(root, "fullscreen", 100, extension if before else (), () if before else extension)
+            try:
+                t.wait(lambda: "[Extensions]" in t.frame(), "composed editor startup")
+                if not sibling:
+                    t.send("?")
+                    t.wait(lambda: t.input_is("!"), "sibling editor behavior preserved")
+                    t.reset_input("!")
+                t.send("/setmod")
+                t.wait(lambda: t.input_is("/setmod") and t.row("setmodel"), "partial command menu")
+                t.send("\t")
+                t.wait(lambda: t.input_is("/setmodel") and t.row("test-reasoner"),
+                       "model menu opens immediately after Tab with another editor wrapper")
+                t.send("\t")
+                base = "/setmodel lab/test-reasoner"
+                t.wait(lambda: t.input_is(base) and t.row("max"), "thinking menu after second Tab")
+                t.reset_input(base)
+                t.paste(base)
+                t.wait(lambda: t.input_is(base), "exact model before space")
+                t.send(" ")
+                t.wait(lambda: t.row("max"), "manual space opens menu in composed editor")
+                if sibling:
+                    t.reset_input(base)
+                    t.send("/extensions")
+                    t.wait(lambda: t.row("extensions"), "sibling command menu")
+                    t.send("\t")
+                    t.wait(lambda: t.input_is("/extensions") and t.row("enable"), "sibling command still cascades")
+            finally:
+                t.close()
+        print(f"PASS composed editor ({'before' if before else 'after'} setmodel): {sibling or 'fixture'}")
+
+
 if __name__ == "__main__":
+    run_editor_composition(Path(sys.argv[3]).resolve() if len(sys.argv) > 3 else None)
     run("fullscreen", 100)
     run("regular", 64)
     run_composition()

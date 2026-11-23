@@ -29,6 +29,7 @@ import {
 import {
   type AutocompleteItem,
   type AutocompleteProvider,
+  type EditorComponent,
   fuzzyFilter,
 } from "@earendil-works/pi-tui";
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -235,14 +236,15 @@ export function createSetmodelAutocompleteProvider(
   };
 }
 
-// Pi 1.6 尚无公开的普通补全刷新接口。只探测已验证版本的能力；
-// 其他版本或已有自定义编辑器时保留原编辑器，用户仍可按 Tab 查询参数。
+// Pi 1.6 尚无公开的普通补全刷新接口。其他版本或不兼容的编辑器仍可按 Tab 查询参数。
 const supportsRefreshShim = /^1\.6\./.test(VERSION);
 
-function getRefresh(editor: CustomEditor): (() => void) | undefined {
-  const refresh = (editor as unknown as { tryTriggerAutocomplete?: unknown }).tryTriggerAutocomplete;
-  return typeof refresh === "function" ? () => refresh.call(editor) : undefined;
-}
+type CompletionEditor = EditorComponent & {
+  focused?: boolean;
+  getCursor?: () => { line: number; col: number };
+  tryTriggerAutocomplete?: () => void;
+};
+type AfterApply = (result: CompletionResult, hasMoreArguments: boolean) => void;
 
 function canonicalPath(path: string): string {
   try { return realpathSync(path); } catch { return path; }
@@ -268,48 +270,59 @@ export default function setmodelExtension(pi: ExtensionAPI): void {
     if (!command) return;
 
     let active = true;
-    let afterApply: (result: CompletionResult, hasMoreArguments: boolean) => void = () => {};
+    let afterApply: AfterApply = () => {};
     const isArgumentContext = (text: string) => !text.includes("\n") && getArguments(text, command) !== undefined;
     stopSession = () => { active = false; };
     ctx.ui.addAutocompleteProvider((current) => createSetmodelAutocompleteProvider(
       current, command, (raw) => active ? suggest(raw) : null, (result, more) => afterApply(result, more),
     ));
 
-    if (!supportsRefreshShim || typeof ctx.ui.getEditorComponent !== "function" || ctx.ui.getEditorComponent()) return;
+    if (!supportsRefreshShim || typeof ctx.ui.getEditorComponent !== "function") return;
 
-    // 不合成按键。键盘、鼠标及唯一候选直接插入都经 applyCompletion，
-    // 先让宿主提交文本并关闭旧菜单，再做一次非强制查询。
-    const factory: Parameters<typeof ctx.ui.setEditorComponent>[0] = (tui, theme, keybindings) => {
+    const previous = ctx.ui.getEditorComponent();
+    const installed = new WeakMap<object, AfterApply>();
+    ctx.ui.setEditorComponent((tui, theme, keybindings) => {
+      const component: EditorComponent = previous?.(tui, theme, keybindings)
+        ?? new CustomEditor(tui, theme, keybindings, { embedWorkingStatus: true });
+      const editor = component as CompletionEditor;
+      const existing = installed.get(editor);
+      afterApply = existing ?? (() => {});
+      if (!active || existing || typeof editor.focused !== "boolean" || typeof editor.getCursor !== "function" ||
+          typeof editor.tryTriggerAutocomplete !== "function" || typeof editor.handleInput !== "function") return editor;
+      const getCursor = editor.getCursor.bind(editor);
+      const refresh = editor.tryTriggerAutocomplete.bind(editor);
+      const handleInput = editor.handleInput.bind(editor);
+
+      // 检查获得焦点的是不是同一个编辑器实例，而不是比较工厂函数：
+      // 之后注册的扩展可以包装我们的工厂并继续使用同一个编辑器。
       const schedule = (text: string, line: number, col: number) => {
         queueMicrotask(() => {
-          if (!active || ctx.ui.getEditorComponent() !== factory || editor.getText() !== text) return;
-          const cursor = editor.getCursor();
-          if (cursor.line === line && cursor.col === col) refresh?.();
+          if (!active || !editor.focused || editor.getText() !== text) return;
+          const cursor = getCursor();
+          if (cursor.line === line && cursor.col === col) refresh();
         });
       };
       let accepted = false;
-      class SetmodelEditor extends CustomEditor {
-        override handleInput(data: string) {
-          accepted = false;
-          const before = this.getText();
-          super.handleInput(data);
-          const text = this.getText();
-          const cursor = this.getCursor();
-          // 手输、删除和粘贴使用同一解析；关闭菜单和移动光标不算编辑。
-          if (refresh && !accepted && text !== before && cursor.col === text.length && isArgumentContext(text)) {
-            schedule(text, cursor.line, cursor.col);
-          }
+      editor.handleInput = (data) => {
+        accepted = false;
+        const before = editor.getText();
+        handleInput(data);
+        const text = editor.getText();
+        const cursor = getCursor();
+        // 手输、删除和粘贴使用同一解析；关闭菜单和移动光标不算编辑。
+        if (active && !accepted && text !== before && cursor.col === text.length && isArgumentContext(text)) {
+          schedule(text, cursor.line, cursor.col);
         }
-      }
-      const editor = new SetmodelEditor(tui, theme, keybindings, { embedWorkingStatus: true });
-      const refresh = getRefresh(editor);
-      afterApply = ({ lines, cursorLine, cursorCol }, more) => {
-        accepted = true;
-        if (refresh && more) schedule(lines.join("\n"), cursorLine, cursorCol);
       };
+      afterApply = ({ lines, cursorLine, cursorCol }, more) => {
+        if (!active || !editor.focused) return;
+        accepted = true;
+        // 等宿主提交文本并关闭旧菜单，再做非强制查询；不合成按键。
+        if (more) schedule(lines.join("\n"), cursorLine, cursorCol);
+      };
+      installed.set(editor, afterApply);
       return editor;
-    };
-    ctx.ui.setEditorComponent(factory);
+    });
   });
 
   pi.on("session_shutdown", () => {
