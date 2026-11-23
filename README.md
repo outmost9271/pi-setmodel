@@ -8,7 +8,7 @@ pi-agent 扩展：在 TUI 中新增 `/setmodel` 命令，一条命令同时完�
 ## 安装
 
 ```bash
-pi install git:github.com/outmost9271/pi-setmodel@v1.0.1
+pi install git:github.com/outmost9271/pi-setmodel@v1.1.0
 ```
 
 或本地路径调试：
@@ -38,14 +38,10 @@ pi install /absolute/path/to/pi-setmodel
 
 ## 补全
 
-- 命令参数带补全：输入模型时与 `/model` 相同的模糊补全
-  （`value=provider/id`、`label=id`、`description=provider`）；
-- 模型 + 第一个空格后，会立即自动弹出思考等级补全；补全列表只显示
-  **该供应商该模型实际支持**的等级（依据模型元数据与 `thinkingLevelMap`
-  过滤，不含其他模型都一样的固定列表）；
-- 选择等级只替换等级片段，模型参数会保留，例如选择 `max` 后得到
-  `/setmodel deepseek/deepseek-v4-pro max`；
-- 思考等级不合法时命令报错并列出该模型支持的等级。
+- 在 Pi 1.6 的默认编辑器中，输入 `/setmo`，用 `Tab` 选中命令即可打开模型列表；选中模型后自动打开该模型的思考等级列表。手输精确模型后加空格、粘贴和继续编辑也使用同一套候选规则。
+- 模型沿用 `/model` 的模糊匹配，插入 `provider/id`；思考等级按该模型的能力和 `thinkingLevelMap` 过滤。选中等级保留模型，不执行命令；再按回车才提交。命令名菜单上的回车仍按 Pi 原生规则提交裸命令。
+- 手输完整模型可直接提交，使用最高支持等级；手输完整等级也不会出现重复候选。参数不支持引号或转义，参数补全仅在单行末尾提供，避免覆盖光标右侧的文本。
+- 使用其他 Pi 版本或自定义编辑器时，不接管编辑器，也不依赖自动级联；可在命令参数处按 `Tab` 查询候选。其他命令、`@` 引用和普通路径仍由原提供器处理。
 
 ## 配置文件路径
 
@@ -59,7 +55,7 @@ pi install /absolute/path/to/pi-setmodel
 ## 复用与实现说明
 
 - 模型匹配逻辑逐句对齐 pi 内置 `findExactModelReferenceMatch`（`/model` 同一语义）；
-- 模型补全项结构与搜索文本对齐内置 `/model` 参数补全（阈值、排序一致，`fuzzyFilter` 来自 `@earendil-works/pi-tui`）；
+- 候选使用公开的 `getArgumentCompletions` 契约，光标保护和显式 `Tab` 路由由提供器包装处理；Pi 1.6 的级联刷新经过版本与能力检测，在宿主提交编辑后查询，不模拟按键；
 - 思考等级能力来自 `@earendil-works/pi-ai` 的 `getSupportedThinkingLevels(model)`；
 - 状态切换复用 `pi.setModel()`（自带认证校验）与 `pi.setThinkingLevel()`；
 - 写 settings.json 采用临时文件 + 原子重命名，避免写一半损坏配置。
@@ -67,9 +63,17 @@ pi install /absolute/path/to/pi-setmodel
 ## 开发
 
 ```bash
-npm install        # 安装 devDependencies 用于类型检查
-npx tsc --noEmit   # 类型检查（tsconfig.json）
+npm ci
+npm test            # 类型、候选、提供器、会话与持久化测试（Node.js 22.18+）
 ```
+
+真实终端回归（Linux 伪终端，需要 Python 和 `pyte==0.8.2`，传入实际 Pi 二进制路径）：
+
+```bash
+python verify-tty.py /absolute/path/to/pi
+```
+
+终端测试使用独立临时目录和离线模式，不读取真实配置或凭据。
 
 ## 许可
 

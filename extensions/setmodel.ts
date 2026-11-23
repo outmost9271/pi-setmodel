@@ -7,7 +7,7 @@
  *
  * 行为：
  *   - <model> 匹配规则与 /model 一致：支持 "provider/id" 或裸 id（跨 provider
- *     有歧义时拒绝），补全的 value 为 "provider/id"。
+ *     有歧义时拒绝），补全时插入 "provider/id" 和下一阶段的分隔空格。
  *   - [thinking] 可选；省略时使用该模型支持的最高思考等级。
  *   - 思考等级会做依赖模型的能力校验（含 thinkingLevelMap 过滤），补全列表
  *     只列出"这个供应商的这个模型"实际支持的等级。
@@ -19,7 +19,7 @@
  * ~/pi 配置目录名 + /agent（CONFIG_DIR_NAME 由 pi 包导出，品牌可换名）。
  */
 
-import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, CustomEditor, VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   type Api,
   type Model,
@@ -30,11 +30,11 @@ import {
   type AutocompleteItem,
   type AutocompleteProvider,
   fuzzyFilter,
-  matchesKey,
 } from "@earendil-works/pi-tui";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // ---------------------------------------------------------------------------
 // 配置文件路径（对齐 pi 内置 getAgentDir / getSettingsPath 的解析规则）
@@ -95,7 +95,7 @@ function persistDefaults(providerId: string, modelId: string, level: ModelThinki
 // 模型匹配与补全（与内置 /model 的 findExactModelReferenceMatch + 补全行文一致）
 // ---------------------------------------------------------------------------
 
-/** 补全用模型来源（ctx 与 session_start 缓存快照共享同一结构）。 */
+/** 从会话范围或模型注册表的内存快照读取，不在补全时查询凭据或网络。 */
 interface ModelsSource {
   scopedModels: readonly { model: Model<Api> }[];
   modelRegistry: { getAvailable(): Model<Api>[] };
@@ -145,88 +145,107 @@ export function getModelSearchText(item: { id: string; provider: string; name: s
   return `${id} ${provider} ${provider}/${id} ${provider} ${id}${name}`;
 }
 
-/** 模型补全：与 /model 完全相同的项结构（value=provider/id、label=id、description=provider）。 */
-export function modelCompletions(source: ModelsSource | undefined, prefix: string): AutocompleteItem[] | null {
-  const models = collectModels(source);
-  if (models.length === 0) return null;
+/** 模型候选沿用 /model 的模糊搜索与展示方式，值附加下一阶段的分隔空格。 */
+function modelCompletions(models: readonly Model<Api>[], prefix: string): AutocompleteItem[] | null {
+  if (models.length === 0 || findExactModelMatch(prefix, models)) return null;
   const items = models.map((model) => ({ id: model.id, provider: model.provider, name: model.name }));
   const filtered = fuzzyFilter(items, prefix, getModelSearchText);
   if (filtered.length === 0) return null;
   return filtered.map((model) => ({
-    value: `${model.provider}/${model.id}`,
+    value: `${model.provider}/${model.id} `,
     label: model.id,
     description: model.provider,
   }));
 }
 
-/** 思考等级补全：只列"该模型"实际支持的等级（经 getSupportedThinkingLevels 过滤）。 */
-export function thinkingCompletions(
-  source: ModelsSource | undefined,
-  modelRef: string,
-  levelPrefix: string,
-): AutocompleteItem[] | null {
-  const model = findExactModelMatch(modelRef, collectModels(source));
-  if (!model) return null;
+/** 返回完整参数值，与宿主的整段替换契约一致。查询可规范化，替换前缀不能。 */
+export function argumentCompletions(source: ModelsSource | undefined, raw: string): AutocompleteItem[] | null {
+  // 命令语法没有引号或转义：与执行一致，按空白分词，不去掉引号。
+  const input = raw.trimStart();
+  const match = /^(\S+)\s+(.*)$/.exec(input);
+  const models = collectModels(source);
+  if (!match) return /\s/.test(input) ? null : modelCompletions(models, input);
+
+  const [, modelRef, rest] = match;
+  const model = findExactModelMatch(modelRef, models);
+  const query = rest.trim().toLowerCase();
+  if (!model || /\s/.test(query)) return null;
   const levels = getSupportedThinkingLevels(model);
-  const query = levelPrefix.trim().toLowerCase();
-  const filtered = query ? levels.filter((level) => level.startsWith(query)) : levels;
-  if (filtered.length === 0) return null;
-  return filtered.map((level) => ({ value: level, label: level }));
+  // 已输完有效等级时让回车直接执行，而不是再次接受一个等值候选。
+  if (levels.some((level) => level === query)) return null;
+  const items = levels.filter((level) => level.startsWith(query))
+    .map((level) => ({ value: `${modelRef} ${level}`, label: level }));
+  return items.length ? items : null;
 }
 
-interface ThinkingCompletionContext {
-  modelRef: string;
-  levelPrefix: string;
+function getArguments(line: string, command: string): string | undefined {
+  const text = line.trimStart();
+  const start = `/${command}`;
+  return text.startsWith(start) && /^[ \t]$/.test(text.charAt(start.length))
+    ? text.slice(start.length + 1)
+    : undefined;
 }
 
-/** 解析光标前的 /setmodel 第二参数上下文。 */
-export function parseThinkingCompletionContext(
-  lines: string[],
-  cursorLine: number,
-  cursorCol: number,
-): ThinkingCompletionContext | undefined {
-  const line = lines[cursorLine] ?? "";
-  const beforeCursor = line.slice(0, cursorCol);
-  const match = beforeCursor.match(/^\/setmodel[ \t]+(\S+)[ \t]+([^\s]*)$/);
-  if (!match?.[1]) return undefined;
-  return { modelRef: match[1], levelPrefix: match[2] ?? "" };
-}
+type CompletionResult = ReturnType<AutocompleteProvider["applyCompletion"]>;
 
-/**
- * 包装内置 provider：第二参数补全只把 levelPrefix 作为替换范围。
- * 这样选择 max 后保留模型，得到 /setmodel provider/model max。
- * 同时允许合成的 Tab 请求在该上下文中走命令补全而不是文件补全。
- */
+/** 仅接管自己的参数，包括宿主路由到强制路径补全的显式 Tab。 */
 export function createSetmodelAutocompleteProvider(
   current: AutocompleteProvider,
-  getSource: () => ModelsSource | undefined,
+  command: string,
+  suggest: (raw: string) => AutocompleteItem[] | null,
+  afterApply: (result: CompletionResult, hasMoreArguments: boolean) => void,
 ): AutocompleteProvider {
+  const ownItems = new WeakSet<AutocompleteItem>();
   return {
     triggerCharacters: current.triggerCharacters,
-    async getSuggestions(lines, cursorLine, cursorCol, options) {
-      const context = parseThinkingCompletionContext(lines, cursorLine, cursorCol);
-      if (!context) return current.getSuggestions(lines, cursorLine, cursorCol, options);
-
-      const items = thinkingCompletions(getSource(), context.modelRef, context.levelPrefix);
-      return items ? { prefix: context.levelPrefix, items } : null;
+    async getSuggestions(lines, line, col, options) {
+      const text = lines[line] ?? "";
+      const raw = getArguments(text, command);
+      if (raw === undefined) return current.getSuggestions(lines, line, col, options);
+      // 仅在单行末尾提供参数补全，不会吞掉或重复光标右侧的文本。
+      if (options.signal.aborted || lines.length !== 1 || col !== text.length) return null;
+      const items = suggest(raw);
+      if (!items?.length) return null;
+      for (const item of items) ownItems.add(item);
+      return { prefix: raw, items };
     },
-    applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
-      return current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
+    applyCompletion(lines, line, col, item, prefix) {
+      const text = lines[line] ?? "";
+      if (ownItems.has(item)) {
+        if (lines.length !== 1 || col !== text.length || getArguments(text, command) !== prefix) {
+          return { lines, cursorLine: line, cursorCol: col };
+        }
+        const next = text.slice(0, col - prefix.length) + item.value;
+        const result = { lines: [next], cursorLine: line, cursorCol: next.length };
+        afterApply(result, item.value.endsWith(" "));
+        return result;
+      }
+      const result = current.applyCompletion(lines, line, col, item, prefix);
+      if (prefix.startsWith("/") && item.value === command && result.lines.length === 1 &&
+          result.cursorCol === result.lines[0].length && getArguments(result.lines[0], command) === "") {
+        afterApply(result, true);
+      }
+      return result;
     },
-    shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
-      if (parseThinkingCompletionContext(lines, cursorLine, cursorCol)) return true;
-      return current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true;
+    shouldTriggerFileCompletion(lines, line, col) {
+      const text = lines[line] ?? "";
+      if (getArguments(text, command) !== undefined) return lines.length === 1 && col === text.length;
+      return current.shouldTriggerFileCompletion?.(lines, line, col) ?? true;
     },
   };
 }
 
-/** 用户刚输入精确模型且尚未输入第二参数。 */
-export function getExactModelBeforeThinkingSpace(
-  text: string,
-  source: ModelsSource | undefined,
-): Model<Api> | undefined {
-  const match = text.match(/^\/setmodel[ \t]+(\S+)$/);
-  return match?.[1] ? findExactModelMatch(match[1], collectModels(source)) : undefined;
+// Pi 1.6 尚无公开的普通补全刷新接口。只探测已验证版本的能力；
+// 其他版本或已有自定义编辑器时保留原编辑器，用户仍可按 Tab 查询参数。
+const supportsRefreshShim = /^1\.6\./.test(VERSION);
+
+function getRefresh(editor: CustomEditor): (() => void) | undefined {
+  const refresh = (editor as unknown as { tryTriggerAutocomplete?: unknown }).tryTriggerAutocomplete;
+  return typeof refresh === "function" ? () => refresh.call(editor) : undefined;
+}
+
+function canonicalPath(path: string): string {
+  try { return realpathSync(path); } catch { return path; }
 }
 
 // ---------------------------------------------------------------------------
@@ -234,53 +253,74 @@ export function getExactModelBeforeThinkingSpace(
 // ---------------------------------------------------------------------------
 
 export default function setmodelExtension(pi: ExtensionAPI): void {
-  // getArgumentCompletions 拿不到 ctx，在 session_start 时缓存最新模型快照。
   let modelsSource: ModelsSource | undefined;
-  let unsubscribeTerminalInput: (() => void) | undefined;
+  let stopSession: (() => void) | undefined;
+  const suggest = (raw: string) => argumentCompletions(modelsSource, raw);
 
   pi.on("session_start", (_event, ctx) => {
-    modelsSource = { scopedModels: ctx.scopedModels, modelRegistry: ctx.modelRegistry };
+    stopSession?.();
+    modelsSource = ctx;
     if (ctx.mode !== "tui") return;
 
-    ctx.ui.addAutocompleteProvider((current) =>
-      createSetmodelAutocompleteProvider(current, () => modelsSource),
-    );
+    const path = canonicalPath(fileURLToPath(import.meta.url));
+    const command = pi.getCommands().find((entry) => entry.source === "extension" &&
+      /^setmodel(?::\d+)?$/.test(entry.name) && canonicalPath(entry.sourceInfo.path) === path)?.name;
+    if (!command) return;
 
-    unsubscribeTerminalInput?.();
-    unsubscribeTerminalInput = ctx.ui.onTerminalInput((data) => {
-      if (!matchesKey(data, "space")) return undefined;
-      const text = ctx.ui.getEditorText();
-      if (!getExactModelBeforeThinkingSpace(text, modelsSource)) return undefined;
+    let active = true;
+    let afterApply: (result: CompletionResult, hasMoreArguments: boolean) => void = () => {};
+    const isArgumentContext = (text: string) => !text.includes("\n") && getArguments(text, command) !== undefined;
+    stopSession = () => { active = false; };
+    ctx.ui.addAutocompleteProvider((current) => createSetmodelAutocompleteProvider(
+      current, command, (raw) => active ? suggest(raw) : null, (result, more) => afterApply(result, more),
+    ));
 
-      // Editor 不把空白符视为自动补全触发符：先写入用户的空格，再把本次
-      // 按键转换为 Tab。上面的 provider 包装器会让该强制请求走等级补全。
-      ctx.ui.setEditorText(`${text} `);
-      return { data: "\t" };
-    });
+    if (!supportsRefreshShim || typeof ctx.ui.getEditorComponent !== "function" || ctx.ui.getEditorComponent()) return;
+
+    // 不合成按键。键盘、鼠标及唯一候选直接插入都经 applyCompletion，
+    // 先让宿主提交文本并关闭旧菜单，再做一次非强制查询。
+    const factory: Parameters<typeof ctx.ui.setEditorComponent>[0] = (tui, theme, keybindings) => {
+      const schedule = (text: string, line: number, col: number) => {
+        queueMicrotask(() => {
+          if (!active || ctx.ui.getEditorComponent() !== factory || editor.getText() !== text) return;
+          const cursor = editor.getCursor();
+          if (cursor.line === line && cursor.col === col) refresh?.();
+        });
+      };
+      let accepted = false;
+      class SetmodelEditor extends CustomEditor {
+        override handleInput(data: string) {
+          accepted = false;
+          const before = this.getText();
+          super.handleInput(data);
+          const text = this.getText();
+          const cursor = this.getCursor();
+          // 手输、删除和粘贴使用同一解析；关闭菜单和移动光标不算编辑。
+          if (refresh && !accepted && text !== before && cursor.col === text.length && isArgumentContext(text)) {
+            schedule(text, cursor.line, cursor.col);
+          }
+        }
+      }
+      const editor = new SetmodelEditor(tui, theme, keybindings, { embedWorkingStatus: true });
+      const refresh = getRefresh(editor);
+      afterApply = ({ lines, cursorLine, cursorCol }, more) => {
+        accepted = true;
+        if (refresh && more) schedule(lines.join("\n"), cursorLine, cursorCol);
+      };
+      return editor;
+    };
+    ctx.ui.setEditorComponent(factory);
   });
 
   pi.on("session_shutdown", () => {
-    unsubscribeTerminalInput?.();
-    unsubscribeTerminalInput = undefined;
+    stopSession?.();
+    stopSession = undefined;
     modelsSource = undefined;
   });
 
   pi.registerCommand("setmodel", {
     description: "Set current and default model with optional thinking level",
-    getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
-      // 尚无空格：正在补全模型（与 /model 一致的模糊补全）
-      if (!/\s/.test(prefix)) {
-        return modelCompletions(modelsSource, prefix);
-      }
-      // 已有空格：第一段是模型引用，其余是思考等级前缀（依赖模型的能力列表）
-      const tokens = prefix.trim().split(/\s+/).filter(Boolean);
-      const modelRef = tokens[0];
-      if (!modelRef) return null;
-      const levels = thinkingCompletions(modelsSource, modelRef, tokens.slice(1).join(" "));
-      // 内置命令 provider 把整段 argumentText 作为替换前缀，所以这里必须
-      // 返回完整参数；TUI provider 包装器则缩小 prefix，只替换等级片段。
-      return levels?.map((item) => ({ ...item, value: `${modelRef} ${item.value}` })) ?? null;
-    },
+    getArgumentCompletions: suggest,
     handler: async (args, ctx) => {
       const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
       const modelRef = parts[0];

@@ -1,152 +1,180 @@
-// 纯函数验证脚本（jiti 加载扩展模块）
-import { createRequire } from "node:module";
-
-const require = createRequire(import.meta.url);
-const { createJiti } = require("./node_modules/@earendil-works/pi-coding-agent/node_modules/jiti/lib/jiti.cjs");
-const jiti = createJiti(import.meta.url);
-const mod = await jiti.import("./extensions/setmodel.ts");
-
-const {
-  default: createExtension,
-  createSetmodelAutocompleteProvider,
-  findExactModelMatch,
-  getExactModelBeforeThinkingSpace,
-  getModelSearchText,
-  modelCompletions,
-  parseThinkingCompletionContext,
-  thinkingCompletions,
-} = mod;
-const { getSupportedThinkingLevels } = await jiti.import("@earendil-works/pi-ai");
-
-const base = {
-  api: {},
-  baseUrl: "https://example.com",
-  input: ["text"],
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  contextWindow: 200000,
-  maxTokens: 16000,
-};
+import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+import { CombinedAutocompleteProvider } from "@earendil-works/pi-tui";
+import createExtension, {
+  argumentCompletions, createSetmodelAutocompleteProvider, findExactModelMatch,
+} from "./extensions/setmodel.ts";
 
 const models = [
-  { ...base, provider: "anthropic", id: "claude-opus-4-8", name: "Claude Opus 4.8", reasoning: true },
-  { ...base, provider: "anthropic", id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5", reasoning: true },
-  { ...base, provider: "deepseek", id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", reasoning: true, thinkingLevelMap: { minimal: null, low: null, medium: null, high: "high", xhigh: null, max: "max" } },
-  { ...base, provider: "deepseek", id: "plain-1", name: "Plain 1", reasoning: false },
-  { ...base, provider: "openai", id: "gpt-5", name: "GPT-5", reasoning: true },
-  { ...base, provider: "openrouter", id: "openai/gpt-5", name: "GPT-5 via OpenRouter", reasoning: true },
-  { ...base, provider: "openrouter", id: "gpt-5", name: "GPT-5 duplicate", reasoning: true },
+  { provider: "lab", id: "reasoner", name: "Reasoner", reasoning: true,
+    thinkingLevelMap: { minimal: null, low: null, medium: null, high: "high", xhigh: null, max: "max" } },
+  { provider: "lab", id: "plain", name: "Plain", reasoning: false },
+  { provider: "other", id: "plain", name: "Other Plain", reasoning: false },
+  { provider: "router", id: "org/target@v1", name: "Target", reasoning: false },
 ];
+const source = { scopedModels: [], modelRegistry: { getAvailable: () => models } };
+const suggest = (raw) => argumentCompletions(source, raw);
+const reasoner = { value: "lab/reasoner ", label: "reasoner", description: "lab" };
+const levels = (...labels) => labels.map((label) => ({ value: `lab/reasoner ${label}`, label }));
 
-let failures = 0;
-function check(name, actual, expected) {
-  const a = JSON.stringify(actual);
-  const e = JSON.stringify(expected);
-  const ok = a === e;
-  if (!ok) failures++;
-  console.log(`${ok ? "PASS" : "FAIL"} ${name}${ok ? "" : `\n  actual:   ${a}\n  expected: ${e}`}`);
+for (const [name, raw, expected] of [
+  ["empty", "", [reasoner, { value: "lab/plain ", label: "plain", description: "lab" },
+    { value: "other/plain ", label: "plain", description: "other" },
+    { value: "router/org/target@v1 ", label: "org/target@v1", description: "router" }]],
+  ["extra leading spaces and fuzzy match", " \t rsnr", [reasoner]],
+  ["exact model can be submitted without level", "LAB/REASONER", null],
+  ["levels filtered by model metadata", "  lab/reasoner   ", levels("off", "high", "max")],
+  ["case-insensitive level prefix", "lab/reasoner \t M", levels("max")],
+  ["complete level", "lab/reasoner MAX", null],
+  ["complete level and trailing spaces", "lab/reasoner off  ", null],
+  ["unsupported level", "lab/reasoner x", null],
+  ["extra argument", "lab/reasoner hi x", null],
+  ["unknown model", "unknown ", null],
+  ["ambiguous model", "plain ", null],
+  ["non-reasoning model", "lab/plain ", [{ value: "lab/plain off", label: "off" }]],
+  ["embedded slash and at", "router/org/target@v1 ", [{ value: "router/org/target@v1 off", label: "off" }]],
+  ["no quote grammar", '"lab/reasoner" ', null],
+  ["no unterminated quotes", "'lab/reasoner ", null],
+]) {
+  test(`candidate: ${name}`, () => assert.deepEqual(suggest(raw), expected));
 }
 
-// --- 1. 模型匹配（对齐 /model 的 findExactModelReferenceMatch） ---
-check("canonical provider/id", findExactModelMatch("anthropic/claude-opus-4-8", models)?.id, "claude-opus-4-8");
-check("bare id unique", findExactModelMatch("claude-sonnet-4-5", models)?.id, "claude-sonnet-4-5");
-check("case-insensitive", findExactModelMatch("ANTHROPIC/CLAUDE-OPUS-4-8", models)?.id, "claude-opus-4-8");
-check("ambiguous bare id", findExactModelMatch("gpt-5", models), undefined);
-check("unknown", findExactModelMatch("nope/x", models), undefined);
-check("empty", findExactModelMatch("   ", models), undefined);
-check("id containing slash via openrouter", findExactModelMatch("openrouter/openai/gpt-5", models)?.id, "openai/gpt-5");
+test("scope, bare ID uniqueness and canonical references", () => {
+  const scoped = { ...source, scopedModels: [{ model: models[2] }] };
+  assert.deepEqual(argumentCompletions(scoped, "")?.map(({ value }) => value), ["other/plain "]);
+  assert.deepEqual(argumentCompletions(scoped, "plain "), [{ value: "plain off", label: "off" }]);
+  assert.equal(findExactModelMatch("plain", models), undefined);
+  assert.equal(findExactModelMatch("reasoner", models), models[0]);
+  assert.equal(findExactModelMatch("ROUTER/ORG/TARGET@V1", models), models[3]);
+});
 
-// --- 2. 模型补全（与 /model 相同的结构） ---
-const comps = modelCompletions({ scopedModels: [], modelRegistry: { getAvailable: () => models } }, "");
-check("empty prefix returns all", comps?.length, models.length);
-check("completion item shape", comps?.[0], { value: "anthropic/claude-opus-4-8", label: "claude-opus-4-8", description: "anthropic" });
-const fuzzy = modelCompletions({ scopedModels: [], modelRegistry: { getAvailable: () => models } }, "deepseek-v4");
-check("fuzzy model filter", fuzzy?.map((c) => c.value), ["deepseek/deepseek-v4-pro"]);
-check("search text format", getModelSearchText({ id: "x", provider: "p", name: "X Name" }), "x p p/x p x X Name");
+const signal = new AbortController().signal;
+const native = new CombinedAutocompleteProvider(["setmodel:2", "else"]);
 
-// scoped 优先
-const scopedComps = modelCompletions(
-  { scopedModels: [{ model: models[2] }], modelRegistry: { getAvailable: () => models } },
-  "",
-);
-check("scoped models win", scopedComps?.map((c) => c.value), ["deepseek/deepseek-v4-pro"]);
+test("provider uses raw argument replacement for normal and forced queries", async () => {
+  const accepted = [];
+  const wrapped = createSetmodelAutocompleteProvider(native, "setmodel:2", suggest, (...args) => accepted.push(args));
+  const start = "/setmodel:2   rsnr";
+  const opts = { signal, force: true };
+  const menu = await wrapped.getSuggestions([start], 0, start.length, opts);
+  assert.deepEqual(menu, { prefix: "  rsnr", items: [reasoner] });
+  assert.deepEqual(wrapped.applyCompletion([start], 0, start.length - 1, menu.items[0], menu.prefix), {
+    lines: [start], cursorLine: 0, cursorCol: start.length - 1,
+  });
+  const selected = wrapped.applyCompletion([start], 0, start.length, menu.items[0], menu.prefix);
+  const next = "/setmodel:2 lab/reasoner ";
+  assert.deepEqual(selected, { lines: [next], cursorLine: 0, cursorCol: next.length });
+  assert.deepEqual(accepted, [[selected, true]]);
+  const thinking = await wrapped.getSuggestions([next], 0, next.length, { signal });
+  assert.deepEqual(thinking, { prefix: "lab/reasoner ", items: levels("off", "high", "max") });
+  const final = wrapped.applyCompletion([next], 0, next.length, thinking.items[2], thinking.prefix);
+  assert.equal(final.lines[0], "/setmodel:2 lab/reasoner max");
+  assert.deepEqual(accepted.at(-1), [final, false]);
+  assert.equal(await wrapped.getSuggestions(final.lines, 0, final.cursorCol, opts), null);
+});
 
-// --- 3. 思考等级补全（依赖具体模型能力） ---
-const source = { scopedModels: [], modelRegistry: { getAvailable: () => models } };
-check("anthropic levels h prefix", thinkingCompletions(source, "anthropic/claude-opus-4-8", "h"), [{ value: "high", label: "high" }]);
-check("anthropic levels empty prefix", thinkingCompletions(source, "anthropic/claude-opus-4-8", "")?.map((c) => c.value), ["off", "minimal", "low", "medium", "high"]);
-check("deepseek thinkingLevelMap filters", thinkingCompletions(source, "deepseek/deepseek-v4-pro", "")?.map((c) => c.value), ["off", "high", "max"]);
-check("non-reasoning model", thinkingCompletions(source, "deepseek/plain-1", "")?.map((c) => c.value), ["off"]);
-check("unknown model no completions", thinkingCompletions(source, "nope/x", ""), null);
-check("unsupported level prefix", thinkingCompletions(source, "deepseek/deepseek-v4-pro", "x"), null);
+test("provider delegates unrelated syntax, preserves right-hand text and respects cancellation", async () => {
+  const calls = [];
+  const previous = {
+    triggerCharacters: ["#"],
+    async getSuggestions(...args) { calls.push(args); return { prefix: "", items: [{ label: "file", value: "file" }] }; },
+    applyCompletion: native.applyCompletion.bind(native),
+    shouldTriggerFileCompletion() { return false; },
+  };
+  const accepted = [];
+  const wrapped = createSetmodelAutocompleteProvider(previous, "setmodel:2", suggest, (...args) => accepted.push(args));
+  const options = { signal, force: true };
+  assert.deepEqual(wrapped.triggerCharacters, ["#"]);
+  for (const line of ["/setmodel:1 x", "/else x", "@some-file", "./file", "/setmo"]) {
+    assert.equal((await wrapped.getSuggestions([line], 0, line.length, options)).items[0].value, "file");
+    assert.equal(wrapped.shouldTriggerFileCompletion([line], 0, line.length), false);
+  }
+  assert.equal(calls.length, 5);
+  const line = "/setmodel:2 lab/reasoner max";
+  assert.equal(await wrapped.getSuggestions([line], 0, line.length - 2, options), null);
+  assert.equal(wrapped.shouldTriggerFileCompletion([line], 0, line.length - 2), false);
+  assert.equal(await wrapped.getSuggestions([line, "extra"], 0, line.length, options), null);
+  const short = "/setmodel:2 ";
+  assert.equal(await wrapped.getSuggestions([short], 0, short.length, { signal: AbortSignal.abort() }), null);
+  assert.equal(wrapped.shouldTriggerFileCompletion([short], 0, short.length), true);
+  const result = wrapped.applyCompletion(["/setmo"], 0, 6, { value: "setmodel:2", label: "setmodel:2" }, "/setmo");
+  assert.equal(result.lines[0], short);
+  assert.deepEqual(accepted, [[result, true]]);
+  const file = wrapped.applyCompletion(["@f tail"], 0, 2, { value: "@file", label: "file" }, "@f");
+  assert.equal(file.lines[0], "@file  tail");
+  assert.equal(accepted.length, 1);
+  assert.equal(calls.length, 5);
+});
 
-// --- 4. 最高等级选择（levels 最后一项） ---
-check("max level for anthropic", getSupportedThinkingLevels(models[0]).at(-1), "high");
-check("max level for deepseek-map", getSupportedThinkingLevels(models[2]).at(-1), "max");
-check("max level for non-reasoning", getSupportedThinkingLevels(models[3]).at(-1), "off");
+function mockPi() {
+  const events = {};
+  const effects = [];
+  let command;
+  createExtension({
+    on(name, cb) { events[name] = cb; },
+    registerCommand(name, options) { command = { name, ...options }; },
+    getCommands() {
+      return [{ name: "setmodel:2", source: "extension", sourceInfo: {
+        path: new URL("./extensions/setmodel.ts", import.meta.url).pathname,
+      } }];
+    },
+    async setModel(model) { effects.push(model.id); return true; },
+    setThinkingLevel(level) { effects.push(level); },
+  });
+  return { events, command, effects };
+}
 
-// --- 5. 第二参数上下文与替换范围 ---
-const thinkingLine = "/setmodel deepseek/deepseek-v4-pro ";
-check(
-  "parse empty thinking prefix",
-  parseThinkingCompletionContext([thinkingLine], 0, thinkingLine.length),
-  { modelRef: "deepseek/deepseek-v4-pro", levelPrefix: "" },
-);
-const typedThinkingLine = `${thinkingLine}m`;
-check(
-  "parse typed thinking prefix",
-  parseThinkingCompletionContext([typedThinkingLine], 0, typedThinkingLine.length),
-  { modelRef: "deepseek/deepseek-v4-pro", levelPrefix: "m" },
-);
-check("ignore first argument context", parseThinkingCompletionContext(["/setmodel deepseek/x"], 0, 24), undefined);
-check("exact model before space", getExactModelBeforeThinkingSpace("/setmodel deepseek/deepseek-v4-pro", source)?.id, "deepseek-v4-pro");
-check("unknown model before space", getExactModelBeforeThinkingSpace("/setmodel nope/x", source), undefined);
+test("public callback fallback and shutdown", () => {
+  const { events, command } = mockPi();
+  events.session_start({}, { mode: "rpc", ...source });
+  assert.deepEqual(command.getArgumentCompletions(" lab/reasoner "), levels("off", "high", "max"));
+  events.session_shutdown();
+  assert.equal(command.getArgumentCompletions(""), null);
+});
 
-const currentProvider = {
-  async getSuggestions() { return null; },
-  applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
-    const next = [...lines];
-    const line = next[cursorLine] ?? "";
-    const before = line.slice(0, cursorCol - prefix.length);
-    const after = line.slice(cursorCol);
-    next[cursorLine] = before + item.value + after;
-    return { lines: next, cursorLine, cursorCol: before.length + item.value.length };
-  },
-  shouldTriggerFileCompletion() { return false; },
-};
-const wrappedProvider = createSetmodelAutocompleteProvider(currentProvider, () => source);
-const wrappedSuggestions = await wrappedProvider.getSuggestions(
-  [thinkingLine], 0, thinkingLine.length,
-  { signal: new AbortController().signal, force: true },
-);
-check("wrapper narrows replacement prefix", wrappedSuggestions?.prefix, "");
-check("wrapper exposes model levels", wrappedSuggestions?.items.map((item) => item.value), ["off", "high", "max"]);
-check("wrapper allows explicit trigger", wrappedProvider.shouldTriggerFileCompletion?.([thinkingLine], 0, thinkingLine.length), true);
-const appliedMax = wrappedProvider.applyCompletion(
-  [thinkingLine], 0, thinkingLine.length,
-  { value: "max", label: "max" },
-  wrappedSuggestions?.prefix ?? "",
-);
-check("selecting max preserves model", appliedMax.lines[0], "/setmodel deepseek/deepseek-v4-pro max");
+test("existing custom editor is not replaced; manual Tab works and old session stops", async () => {
+  const { events } = mockPi();
+  let wrap;
+  events.session_start({}, { mode: "tui", ...source, ui: {
+    addAutocompleteProvider(factory) { wrap = factory; },
+    getEditorComponent() { return () => {}; },
+    setEditorComponent() { assert.fail("must not replace existing editor"); },
+  } });
+  const wrapped = wrap(native);
+  const line = "/setmodel:2 rsnr";
+  assert.deepEqual((await wrapped.getSuggestions([line], 0, line.length, { signal, force: true })).items, [reasoner]);
+  events.session_shutdown();
+  assert.equal(await wrapped.getSuggestions([line], 0, line.length, { signal, force: true }), null);
+});
 
-// --- 6. registerCommand 回退路径也返回完整参数 ---
-const handlers = {};
-let registeredCommand;
-const fakePi = {
-  on(name, handler) { handlers[name] = handler; },
-  registerCommand(name, options) { registeredCommand = { name, ...options }; },
-};
-createExtension(fakePi);
-handlers.session_start({}, { mode: "rpc", scopedModels: [], modelRegistry: source.modelRegistry });
-const commandLevels = registeredCommand.getArgumentCompletions("deepseek/deepseek-v4-pro ");
-check(
-  "command fallback values keep model",
-  commandLevels?.map((item) => item.value),
-  [
-    "deepseek/deepseek-v4-pro off",
-    "deepseek/deepseek-v4-pro high",
-    "deepseek/deepseek-v4-pro max",
-  ],
-);
-
-console.log(failures === 0 ? "\nALL PASSED" : `\n${failures} FAILED`);
-process.exit(failures === 0 ? 0 : 1);
+test("submission validates arguments independently and persists only defaults", async () => {
+  const { command, effects } = mockPi();
+  const notifications = [];
+  const ctx = { ...source, ui: { notify(...args) { notifications.push(args); } } };
+  const dir = await mkdtemp(join(tmpdir(), "setmodel-test-"));
+  const path = join(dir, "settings.json");
+  const original = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = dir;
+  try {
+    await writeFile(path, '{"keep":true}');
+    await command.handler('"lab/reasoner" high', ctx);
+    await command.handler("lab/reasoner max extra", ctx);
+    await command.handler("lab/reasoner low", ctx);
+    assert.deepEqual(effects, []);
+    assert.deepEqual(notifications.map(([, type]) => type), ["error", "warning", "error"]);
+    await command.handler("lab/reasoner", ctx);
+    assert.deepEqual(effects, ["reasoner", "max"]);
+    await command.handler("  lab/reasoner  HIGH  ", ctx);
+    assert.deepEqual(effects, ["reasoner", "max", "reasoner", "high"]);
+    assert.deepEqual(JSON.parse(await readFile(path, "utf8")), {
+      keep: true, defaultProvider: "lab", defaultModel: "reasoner", defaultThinkingLevel: "high",
+    });
+  } finally {
+    if (original === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = original;
+    await rm(dir, { recursive: true, force: true });
+  }
+});

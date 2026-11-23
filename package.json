@@ -1,7 +1,8 @@
 {
   "name": "pi-setmodel",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "pi-agent extension: /setmodel — set current and default model plus thinking level",
+  "type": "module",
   "keywords": ["pi-package"],
   "license": "MIT",
   "author": "outmost9271",
@@ -14,10 +15,13 @@
     "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.84.3",
-    "@earendil-works/pi-coding-agent": "0.84.3",
-    "@earendil-works/pi-tui": "0.84.3",
+    "@earendil-works/pi-ai": "1.6.0",
+    "@earendil-works/pi-coding-agent": "1.6.0",
+    "@earendil-works/pi-tui": "1.6.0",
     "typebox": "1.3.7",
     "typescript": "5.9.3"
+  },
+  "scripts": {
+    "test": "tsc --noEmit && node --test verify.mjs"
   }
 }
